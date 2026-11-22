@@ -1,0 +1,769 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global Safety Net (Default Deny)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Primitive Helpers ---
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidShortId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 64 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidLookupKey(key) {
+      return key is string && key.size() >= 4 && key.size() <= 80 && key.matches('^[a-zA-Z0-9._\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isSignedInMember() {
+      return isSignedIn()
+        && (request.auth.token.email_verified == true
+          || request.auth.token.firebase.sign_in_provider == 'password');
+    }
+
+    function isPrimaryAdmin() {
+      return isVerifiedUser() && request.auth.token.email == 'stetons69@gmail.com';
+    }
+
+    function isAdmin() {
+      return isPrimaryAdmin()
+        || (isVerifiedUser() && exists(/databases/$(database)/documents/admins/$(request.auth.uid)));
+    }
+
+    function isOwner(uid) {
+      return isSignedInMember() && request.auth.uid == uid;
+    }
+
+    function isClaimedSeededOwner(seededUid) {
+      return isSignedInMember()
+        && seededUid == 'member_0036028172'
+        && exists(/databases/$(database)/documents/memberCredentials/0036028172)
+        && get(/databases/$(database)/documents/memberCredentials/0036028172).data.claimedUid == request.auth.uid;
+    }
+
+    function isValidCurrency(c) {
+      return c is string && c.size() == 3 && c in ['USD', 'EUR', 'GBP'];
+    }
+
+    function accountExists(accountId) {
+      return isValidShortId(accountId)
+        && exists(/databases/$(database)/documents/accounts/$(accountId));
+    }
+
+    function ownsAccount(accountId) {
+      return accountExists(accountId)
+        && get(/databases/$(database)/documents/accounts/$(accountId)).data.userId == request.auth.uid;
+    }
+
+    function hasWithdrawalAccess(uid) {
+      return exists(/databases/$(database)/documents/users/$(uid))
+        && 'withdrawalFrozen' in get(/databases/$(database)/documents/users/$(uid)).data
+        && get(/databases/$(database)/documents/users/$(uid)).data.withdrawalFrozen == false;
+    }
+
+    function isFrozenBlockedTxType(data) {
+      return data.txType in ['transfer_out', 'bill_pay', 'card_spend']
+        || (data.txType == 'p2p_transfer' && data.direction == 'debit');
+    }
+
+    // --- Validation Blueprints ---
+    function isValidUserProfile(data, userId) {
+      return data.keys().hasAll(['uid', 'displayName', 'email', 'handle', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly([
+          'uid', 'displayName', 'email', 'handle',
+          'dateOfBirth', 'gender', 'primaryAccountNumber', 'primaryRoutingNumber',
+          'withdrawalFrozen', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.uid)
+        && data.uid == userId
+        && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 80
+        && data.email is string && data.email.size() >= 3 && data.email.size() <= 120
+        && data.handle is string && data.handle.size() >= 2 && data.handle.size() <= 32 && data.handle.matches('^@[a-zA-Z0-9._\\-]+$')
+        && (!('dateOfBirth' in data) || (data.dateOfBirth is string && data.dateOfBirth.size() == 10 && data.dateOfBirth.matches('^[0-9]{2}/[0-9]{2}/[0-9]{4}$')))
+        && (!('gender' in data) || (data.gender is string && data.gender.size() >= 1 && data.gender.size() <= 32 && data.gender in ['Male', 'Female', 'Other', 'Prefer not to say']))
+        && (!('primaryAccountNumber' in data) || (data.primaryAccountNumber is string && data.primaryAccountNumber.size() >= 10 && data.primaryAccountNumber.size() <= 12 && data.primaryAccountNumber.matches('^[0-9]{10,12}$')))
+        && (!('primaryRoutingNumber' in data) || (data.primaryRoutingNumber is string && data.primaryRoutingNumber.size() >= 9 && data.primaryRoutingNumber.size() <= 11 && data.primaryRoutingNumber.matches('^[0-9]{9,11}$')))
+        && (!('withdrawalFrozen' in data) || data.withdrawalFrozen is bool)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidBankAccount(data, accountId) {
+      return data.keys().hasAll([
+          'id', 'userId', 'name', 'accountType', 'currency',
+          'accountNumber', 'routingNumber', 'iban', 'balanceCents',
+          'status', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'userId', 'name', 'accountType', 'currency',
+          'accountNumber', 'routingNumber', 'iban', 'balanceCents',
+          'status', 'lastTransferId', 'createdAt', 'updatedAt'
+        ])
+        && isValidShortId(data.id)
+        && data.id == accountId
+        && isValidId(data.userId)
+        && data.name is string && data.name.size() >= 2 && data.name.size() <= 60
+        && data.accountType is string && data.accountType.size() <= 16 && data.accountType in ['checking', 'savings', 'treasury']
+        && isValidCurrency(data.currency)
+        && data.accountNumber is string && data.accountNumber.size() >= 10 && data.accountNumber.size() <= 12 && data.accountNumber.matches('^[0-9]{10,12}$')
+        && data.routingNumber is string && data.routingNumber.size() >= 9 && data.routingNumber.size() <= 11 && data.routingNumber.matches('^[0-9]{9,11}$')
+        && data.iban is string && data.iban.size() >= 14 && data.iban.size() <= 34 && data.iban.matches('^[A-Z0-9]+$')
+        && data.balanceCents is int && data.balanceCents >= 0 && data.balanceCents <= 100000000000
+        && data.status is string && data.status.size() <= 16 && data.status in ['active', 'frozen']
+        && (!('lastTransferId' in data) || isValidShortId(data.lastTransferId))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidLedgerTransaction(data, txId) {
+      return data.keys().hasAll([
+          'id', 'userId', 'accountId', 'direction', 'txType',
+          'amountCents', 'currency', 'counterpartyName', 'counterpartyDetail',
+          'category', 'referenceCode', 'memo', 'status', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'userId', 'accountId', 'direction', 'txType',
+          'amountCents', 'currency', 'counterpartyName', 'counterpartyDetail',
+          'category', 'referenceCode', 'memo', 'status', 'paymentRequestId',
+          'peerTransferId', 'createdAt', 'updatedAt'
+        ])
+        && isValidShortId(data.id)
+        && data.id == txId
+        && isValidId(data.userId)
+        && isValidShortId(data.accountId)
+        && data.direction is string && data.direction.size() <= 12 && data.direction in ['credit', 'debit']
+        && data.txType is string && data.txType.size() <= 24 && data.txType in [
+          'deposit', 'payment_received', 'wire_in',
+          'transfer_out', 'internal_transfer', 'bill_pay', 'card_spend',
+          'p2p_transfer', 'admin_top_up'
+        ]
+        && data.amountCents is int && data.amountCents > 0 && data.amountCents <= 10000000000
+        && isValidCurrency(data.currency)
+        && data.counterpartyName is string && data.counterpartyName.size() >= 1 && data.counterpartyName.size() <= 80
+        && data.counterpartyDetail is string && data.counterpartyDetail.size() <= 120
+        && data.category is string && data.category.size() >= 1 && data.category.size() <= 40
+        && data.referenceCode is string && data.referenceCode.size() >= 4 && data.referenceCode.size() <= 32 && data.referenceCode.matches('^[A-Z0-9\\-]+$')
+        && data.memo is string && data.memo.size() <= 160
+        && data.status is string && data.status.size() <= 16 && data.status in ['settled', 'pending', 'cancelled']
+        && (!('paymentRequestId' in data) || (data.paymentRequestId is string && data.paymentRequestId.size() <= 64 && data.paymentRequestId.matches('^[a-zA-Z0-9_\\-]*$')))
+        && (!('peerTransferId' in data) || (data.peerTransferId is string && data.peerTransferId.size() <= 64 && data.peerTransferId.matches('^[a-zA-Z0-9_\\-]*$')))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidPaymentRequest(data, requestId) {
+      return data.keys().hasAll([
+          'id', 'userId', 'accountId', 'title', 'payerName', 'payerEmail',
+          'amountCents', 'currency', 'memo', 'referenceCode', 'status',
+          'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'userId', 'accountId', 'title', 'payerName', 'payerEmail',
+          'amountCents', 'currency', 'memo', 'referenceCode', 'status',
+          'paidAt', 'createdAt', 'updatedAt'
+        ])
+        && isValidShortId(data.id)
+        && data.id == requestId
+        && isValidId(data.userId)
+        && isValidShortId(data.accountId)
+        && data.title is string && data.title.size() >= 2 && data.title.size() <= 80
+        && data.payerName is string && data.payerName.size() >= 1 && data.payerName.size() <= 80
+        && data.payerEmail is string && data.payerEmail.size() <= 120
+        && data.amountCents is int && data.amountCents > 0 && data.amountCents <= 10000000000
+        && isValidCurrency(data.currency)
+        && data.memo is string && data.memo.size() <= 160
+        && data.referenceCode is string && data.referenceCode.size() >= 4 && data.referenceCode.size() <= 32 && data.referenceCode.matches('^[A-Z0-9\\-]+$')
+        && data.status is string && data.status.size() <= 16 && data.status in ['pending', 'paid', 'cancelled']
+        && (!('paidAt' in data) || data.paidAt is timestamp)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidBeneficiary(data, beneficiaryId) {
+      return data.keys().hasAll([
+          'id', 'userId', 'name', 'bankName', 'routingNumber',
+          'accountLast4', 'accountType', 'email', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'userId', 'name', 'bankName', 'routingNumber',
+          'accountLast4', 'accountType', 'email', 'createdAt', 'updatedAt'
+        ])
+        && isValidShortId(data.id)
+        && data.id == beneficiaryId
+        && isValidId(data.userId)
+        && data.name is string && data.name.size() >= 2 && data.name.size() <= 80
+        && data.bankName is string && data.bankName.size() >= 2 && data.bankName.size() <= 80
+        && data.routingNumber is string && data.routingNumber.size() == 9 && data.routingNumber.matches('^[0-9]{9}$')
+        && data.accountLast4 is string && data.accountLast4.size() == 4 && data.accountLast4.matches('^[0-9]{4}$')
+        && data.accountType is string && data.accountType.size() <= 16 && data.accountType in ['checking', 'savings', 'wire']
+        && data.email is string && data.email.size() <= 120
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidVirtualCard(data, cardId) {
+      return data.keys().hasAll([
+          'id', 'userId', 'accountId', 'label', 'holderName', 'last4',
+          'expiry', 'network', 'monthlyLimitCents', 'spentThisMonthCents',
+          'status', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'userId', 'accountId', 'label', 'holderName', 'last4',
+          'expiry', 'network', 'monthlyLimitCents', 'spentThisMonthCents',
+          'status', 'createdAt', 'updatedAt'
+        ])
+        && isValidShortId(data.id)
+        && data.id == cardId
+        && isValidId(data.userId)
+        && isValidShortId(data.accountId)
+        && data.label is string && data.label.size() >= 2 && data.label.size() <= 50
+        && data.holderName is string && data.holderName.size() >= 2 && data.holderName.size() <= 80
+        && data.last4 is string && data.last4.size() == 4 && data.last4.matches('^[0-9]{4}$')
+        && data.expiry is string && data.expiry.size() == 5 && data.expiry.matches('^(0[1-9]|1[0-2])\\/[0-9]{2}$')
+        && data.network is string && data.network.size() <= 16 && data.network in ['Visa', 'Mastercard']
+        && data.monthlyLimitCents is int && data.monthlyLimitCents >= 1000 && data.monthlyLimitCents <= 1000000000
+        && data.spentThisMonthCents is int && data.spentThisMonthCents >= 0 && data.spentThisMonthCents <= 1000000000
+        && data.status is string && data.status.size() <= 16 && data.status in ['active', 'frozen']
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidScheduledPayment(data, scheduledId) {
+      return data.keys().hasAll([
+          'id', 'userId', 'accountId', 'payeeName', 'category',
+          'amountCents', 'currency', 'cadence', 'nextDueDate',
+          'status', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'userId', 'accountId', 'payeeName', 'category',
+          'amountCents', 'currency', 'cadence', 'nextDueDate',
+          'status', 'createdAt', 'updatedAt'
+        ])
+        && isValidShortId(data.id)
+        && data.id == scheduledId
+        && isValidId(data.userId)
+        && isValidShortId(data.accountId)
+        && data.payeeName is string && data.payeeName.size() >= 2 && data.payeeName.size() <= 80
+        && data.category is string && data.category.size() >= 1 && data.category.size() <= 40
+        && data.amountCents is int && data.amountCents > 0 && data.amountCents <= 10000000000
+        && isValidCurrency(data.currency)
+        && data.cadence is string && data.cadence.size() <= 16 && data.cadence in ['once', 'weekly', 'monthly']
+        && data.nextDueDate is string && data.nextDueDate.size() == 10 && data.nextDueDate.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+        && data.status is string && data.status.size() <= 16 && data.status in ['scheduled', 'completed', 'cancelled']
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidRecipientDirectoryEntry(data, lookupKey) {
+      return data.keys().hasAll([
+          'lookupKey', 'accountId', 'userId', 'displayName', 'handle',
+          'accountName', 'accountLast4', 'currency', 'status',
+          'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'lookupKey', 'accountId', 'userId', 'displayName', 'handle',
+          'accountName', 'accountLast4', 'currency', 'status',
+          'createdAt', 'updatedAt'
+        ])
+        && isValidLookupKey(data.lookupKey)
+        && data.lookupKey == lookupKey
+        && isValidShortId(data.accountId)
+        && isValidId(data.userId)
+        && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 80
+        && data.handle is string && data.handle.size() >= 2 && data.handle.size() <= 32 && data.handle.matches('^@[a-zA-Z0-9._\\-]+$')
+        && data.accountName is string && data.accountName.size() >= 2 && data.accountName.size() <= 60
+        && data.accountLast4 is string && data.accountLast4.size() == 4 && data.accountLast4.matches('^[0-9]{4}$')
+        && isValidCurrency(data.currency)
+        && data.status is string && data.status.size() <= 16 && data.status in ['active', 'frozen']
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidPeerTransfer(data, transferId) {
+      return data.keys().hasAll([
+          'id', 'fromUserId', 'fromAccountId', 'toUserId', 'toAccountId',
+          'amountCents', 'currency', 'referenceCode', 'memo', 'createdAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'fromUserId', 'fromAccountId', 'toUserId', 'toAccountId',
+          'amountCents', 'currency', 'referenceCode', 'memo', 'createdAt'
+        ])
+        && isValidShortId(data.id)
+        && data.id == transferId
+        && isValidId(data.fromUserId)
+        && isValidShortId(data.fromAccountId)
+        && isValidId(data.toUserId)
+        && isValidShortId(data.toAccountId)
+        && data.fromAccountId != data.toAccountId
+        && data.amountCents is int && data.amountCents > 0 && data.amountCents <= 10000000000
+        && isValidCurrency(data.currency)
+        && data.referenceCode is string && data.referenceCode.size() >= 4 && data.referenceCode.size() <= 32 && data.referenceCode.matches('^[A-Z0-9\\-]+$')
+        && data.memo is string && data.memo.size() <= 160
+        && data.createdAt is timestamp;
+    }
+
+    function isValidAdminRecord(data, adminUid) {
+      return data.keys().hasAll(['uid', 'email', 'displayName', 'grantedBy', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'email', 'displayName', 'grantedBy', 'createdAt', 'updatedAt'])
+        && isValidId(data.uid)
+        && data.uid == adminUid
+        && data.email is string && data.email.size() >= 3 && data.email.size() <= 120
+        && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 80
+        && data.grantedBy is string && data.grantedBy.size() >= 1 && data.grantedBy.size() <= 128
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidMemberCredential(data, accountNumber) {
+      return data.keys().hasAll(['accountNumber', 'routingHash', 'claimProof', 'userId', 'claimedUid', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['accountNumber', 'routingHash', 'claimProof', 'userId', 'claimedUid', 'createdAt', 'updatedAt'])
+        && data.accountNumber is string
+        && data.accountNumber.size() >= 10
+        && data.accountNumber.size() <= 12
+        && data.accountNumber.matches('^[0-9]{10,12}$')
+        && data.accountNumber == accountNumber
+        && data.routingHash is string
+        && data.routingHash.size() == 64
+        && data.routingHash.matches('^[a-f0-9]{64}$')
+        && data.claimProof is string
+        && data.claimProof.size() <= 64
+        && data.claimProof.matches('^([a-f0-9]{64})?$')
+        && isValidId(data.userId)
+        && data.claimedUid is string
+        && data.claimedUid.size() <= 128
+        && data.claimedUid.matches('^[a-zA-Z0-9_\\-]*$')
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // --- Atomic Peer Transfer Verification Helpers ---
+    function verifyPeerTransferDoc(transfer, toAccountId, toUserId, currency, creditedAmountCents) {
+      return transfer.fromUserId == request.auth.uid
+        && transfer.toAccountId == toAccountId
+        && transfer.toUserId == toUserId
+        && transfer.fromAccountId != toAccountId
+        && transfer.currency == currency
+        && transfer.amountCents == creditedAmountCents
+        && transfer.amountCents > 0
+        && exists(/databases/$(database)/documents/accounts/$(transfer.fromAccountId))
+        && existsAfter(/databases/$(database)/documents/accounts/$(transfer.fromAccountId))
+        && get(/databases/$(database)/documents/accounts/$(transfer.fromAccountId)).data.userId == request.auth.uid
+        && get(/databases/$(database)/documents/accounts/$(transfer.fromAccountId)).data.status == 'active'
+        && get(/databases/$(database)/documents/accounts/$(transfer.fromAccountId)).data.currency == currency
+        && getAfter(/databases/$(database)/documents/accounts/$(transfer.fromAccountId)).data.userId == request.auth.uid
+        && getAfter(/databases/$(database)/documents/accounts/$(transfer.fromAccountId)).data.currency == currency
+        && get(/databases/$(database)/documents/accounts/$(transfer.fromAccountId)).data.balanceCents
+           - getAfter(/databases/$(database)/documents/accounts/$(transfer.fromAccountId)).data.balanceCents
+           == creditedAmountCents;
+    }
+
+    function isValidPeerCredit(accountId) {
+      return isSignedInMember()
+        && existing().status == 'active'
+        && incoming().diff(existing()).affectedKeys().hasOnly(['balanceCents', 'lastTransferId', 'updatedAt'])
+        && 'lastTransferId' in incoming()
+        && isValidShortId(incoming().lastTransferId)
+        && (!('lastTransferId' in existing()) || incoming().lastTransferId != existing().lastTransferId)
+        && incoming().balanceCents > existing().balanceCents
+        && existsAfter(/databases/$(database)/documents/peerTransfers/$(incoming().lastTransferId))
+        && verifyPeerTransferDoc(
+             getAfter(/databases/$(database)/documents/peerTransfers/$(incoming().lastTransferId)).data,
+             accountId,
+             existing().userId,
+             existing().currency,
+             incoming().balanceCents - existing().balanceCents
+           );
+    }
+
+    function verifyPeerCreditTxDoc(transfer, tx) {
+      return transfer.fromUserId == request.auth.uid
+        && transfer.toUserId == tx.userId
+        && transfer.toAccountId == tx.accountId
+        && transfer.amountCents == tx.amountCents
+        && transfer.currency == tx.currency
+        && transfer.referenceCode == tx.referenceCode;
+    }
+
+    function isValidPeerCreditTx(tx) {
+      return tx.direction == 'credit'
+        && tx.txType == 'p2p_transfer'
+        && tx.status == 'settled'
+        && 'peerTransferId' in tx
+        && isValidShortId(tx.peerTransferId)
+        && existsAfter(/databases/$(database)/documents/peerTransfers/$(tx.peerTransferId))
+        && verifyPeerCreditTxDoc(
+             getAfter(/databases/$(database)/documents/peerTransfers/$(tx.peerTransferId)).data,
+             tx
+           );
+    }
+
+    // --- Collection Rules ---
+
+    // 1. Users (Private Profile, strict owner or admin isolation)
+    match /users/{userId} {
+      allow get: if isValidId(userId) && (isOwner(userId) || isAdmin() || isClaimedSeededOwner(userId));
+      allow list: if isAdmin();
+      allow create: if isValidId(userId)
+        && (isOwner(userId) || isAdmin())
+        && isValidUserProfile(incoming(), userId)
+        && 'withdrawalFrozen' in incoming()
+        && (
+          incoming().withdrawalFrozen == true ||
+          isAdmin() ||
+          (
+            isClaimedSeededOwner('member_0036028172')
+            && exists(/databases/$(database)/documents/users/member_0036028172)
+            && incoming().withdrawalFrozen == get(/databases/$(database)/documents/users/member_0036028172).data.withdrawalFrozen
+          )
+        )
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(userId)
+        && (isOwner(userId) || isAdmin())
+        && isValidUserProfile(incoming(), userId)
+        && incoming().uid == existing().uid
+        && incoming().email == existing().email
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'handle', 'updatedAt']) ||
+          (
+            isAdmin()
+            && 'withdrawalFrozen' in incoming()
+            && incoming().withdrawalFrozen is bool
+            && incoming().diff(existing()).affectedKeys().hasOnly(['withdrawalFrozen', 'updatedAt'])
+          )
+        );
+      allow delete: if isValidId(userId) && isClaimedSeededOwner(userId);
+    }
+
+    // 2. Bank Accounts
+    match /accounts/{accountId} {
+      allow get: if isValidShortId(accountId) && (isOwner(existing().userId) || isAdmin() || isClaimedSeededOwner(existing().userId));
+      allow list: if isAdmin() || (isSignedInMember() && existing().userId == request.auth.uid);
+      allow create: if isValidShortId(accountId)
+        && isSignedInMember()
+        && isValidBankAccount(incoming(), accountId)
+        && (incoming().userId == request.auth.uid || isAdmin())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidShortId(accountId)
+        && isValidBankAccount(incoming(), accountId)
+        && incoming().id == existing().id
+        && incoming().accountType == existing().accountType
+        && incoming().currency == existing().currency
+        && incoming().accountNumber == existing().accountNumber
+        && incoming().routingNumber == existing().routingNumber
+        && incoming().iban == existing().iban
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          (
+            (isOwner(existing().userId) || isAdmin())
+            && incoming().userId == existing().userId
+            && (
+              // Action: Update Balance (Deposit, Transfer, Card Spend, Request Settlement, Admin Top-Up)
+              (incoming().diff(existing()).affectedKeys().hasOnly(['balanceCents', 'updatedAt']) && (existing().status == 'active' || isAdmin())) ||
+              // Action: Rename Account
+              (incoming().diff(existing()).affectedKeys().hasOnly(['name', 'updatedAt'])) ||
+              // Action: Toggle Freeze Status
+              (incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt']))
+            )
+          ) ||
+          // Action: Claim Pre-Seeded Account Ownership After Proof Verification
+          (
+            isClaimedSeededOwner(existing().userId)
+            && incoming().userId == request.auth.uid
+            && incoming().balanceCents == existing().balanceCents
+            && incoming().status == existing().status
+            && incoming().name == existing().name
+            && incoming().diff(existing()).affectedKeys().hasOnly(['userId', 'updatedAt'])
+          ) ||
+          // Action: Atomic Cross-User Peer-to-Peer Credit
+          (incoming().userId == existing().userId && isValidPeerCredit(accountId))
+        );
+      allow delete: if false;
+    }
+
+    // 3. Ledger Transactions (Terminal-locked once settled/cancelled)
+    match /transactions/{transactionId} {
+      allow get: if isValidShortId(transactionId) && (isOwner(existing().userId) || isAdmin());
+      allow list: if isAdmin() || (isSignedInMember() && existing().userId == request.auth.uid);
+      allow create: if isValidShortId(transactionId)
+        && isSignedInMember()
+        && isValidLedgerTransaction(incoming(), transactionId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && (!isFrozenBlockedTxType(incoming()) || hasWithdrawalAccess(request.auth.uid))
+        && (
+          (incoming().userId == request.auth.uid && ownsAccount(incoming().accountId) && incoming().txType != 'admin_top_up') ||
+          (isAdmin() && (accountExists(incoming().accountId) || (isValidShortId(incoming().accountId) && existsAfter(/databases/$(database)/documents/accounts/$(incoming().accountId))))) ||
+          isValidPeerCreditTx(incoming())
+        );
+      allow update: if isValidShortId(transactionId)
+        && (isOwner(existing().userId) || isAdmin())
+        && isValidLedgerTransaction(incoming(), transactionId)
+        && existing().status == 'pending'
+        && incoming().id == existing().id
+        && incoming().userId == existing().userId
+        && incoming().accountId == existing().accountId
+        && incoming().direction == existing().direction
+        && incoming().txType == existing().txType
+        && incoming().amountCents == existing().amountCents
+        && incoming().currency == existing().currency
+        && incoming().referenceCode == existing().referenceCode
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          !(incoming().status == 'settled' && existing().direction == 'debit' && isFrozenBlockedTxType(existing()))
+          || hasWithdrawalAccess(existing().userId)
+          || isAdmin()
+        )
+        && (
+          // Action: Settle or Cancel Pending Transaction
+          (incoming().status in ['settled', 'cancelled'] && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt']))
+        );
+      allow delete: if false;
+    }
+
+    // 4. Payment Requests (Terminal-locked once paid/cancelled)
+    match /paymentRequests/{requestId} {
+      allow get: if isValidShortId(requestId) && (isOwner(existing().userId) || isAdmin());
+      allow list: if isAdmin() || (isSignedInMember() && existing().userId == request.auth.uid);
+      allow create: if isValidShortId(requestId)
+        && isSignedInMember()
+        && isValidPaymentRequest(incoming(), requestId)
+        && ((incoming().userId == request.auth.uid && ownsAccount(incoming().accountId)) || (isAdmin() && accountExists(incoming().accountId)))
+        && incoming().status == 'pending'
+        && !('paidAt' in incoming())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidShortId(requestId)
+        && (isOwner(existing().userId) || isAdmin())
+        && isValidPaymentRequest(incoming(), requestId)
+        && existing().status == 'pending'
+        && incoming().id == existing().id
+        && incoming().userId == existing().userId
+        && incoming().accountId == existing().accountId
+        && incoming().amountCents == existing().amountCents
+        && incoming().currency == existing().currency
+        && incoming().referenceCode == existing().referenceCode
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          // Action: Mark Request Paid
+          (incoming().status == 'paid' && 'paidAt' in incoming() && incoming().paidAt == request.time && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'paidAt', 'updatedAt'])) ||
+          // Action: Cancel Request
+          (incoming().status == 'cancelled' && !('paidAt' in incoming()) && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt']))
+        );
+      allow delete: if isValidShortId(requestId) && (isOwner(existing().userId) || isAdmin()) && existing().status == 'pending';
+    }
+
+    // 5. Beneficiaries
+    match /beneficiaries/{beneficiaryId} {
+      allow get: if isValidShortId(beneficiaryId) && (isOwner(existing().userId) || isAdmin());
+      allow list: if isAdmin() || (isSignedInMember() && existing().userId == request.auth.uid);
+      allow create: if isValidShortId(beneficiaryId)
+        && isSignedInMember()
+        && isValidBeneficiary(incoming(), beneficiaryId)
+        && (incoming().userId == request.auth.uid || isAdmin())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidShortId(beneficiaryId)
+        && (isOwner(existing().userId) || isAdmin())
+        && isValidBeneficiary(incoming(), beneficiaryId)
+        && incoming().id == existing().id
+        && incoming().userId == existing().userId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          // Action: Update Beneficiary Contact Info
+          incoming().diff(existing()).affectedKeys().hasOnly(['name', 'bankName', 'routingNumber', 'accountLast4', 'accountType', 'email', 'updatedAt'])
+        );
+      allow delete: if isValidShortId(beneficiaryId) && (isOwner(existing().userId) || isAdmin());
+    }
+
+    // 6. Virtual Cards
+    match /cards/{cardId} {
+      allow get: if isValidShortId(cardId) && (isOwner(existing().userId) || isAdmin());
+      allow list: if isAdmin() || (isSignedInMember() && existing().userId == request.auth.uid);
+      allow create: if isValidShortId(cardId)
+        && isSignedInMember()
+        && isValidVirtualCard(incoming(), cardId)
+        && ((incoming().userId == request.auth.uid && ownsAccount(incoming().accountId)) || (isAdmin() && accountExists(incoming().accountId)))
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidShortId(cardId)
+        && (isOwner(existing().userId) || isAdmin())
+        && isValidVirtualCard(incoming(), cardId)
+        && incoming().id == existing().id
+        && incoming().userId == existing().userId
+        && incoming().accountId == existing().accountId
+        && incoming().last4 == existing().last4
+        && incoming().expiry == existing().expiry
+        && incoming().network == existing().network
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          // Action: Freeze / Unfreeze Card
+          (incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt'])) ||
+          // Action: Update Limit or Label
+          (incoming().diff(existing()).affectedKeys().hasOnly(['label', 'monthlyLimitCents', 'updatedAt'])) ||
+          // Action: Record Card Spend
+          (existing().status == 'active' && hasWithdrawalAccess(existing().userId) && incoming().diff(existing()).affectedKeys().hasOnly(['spentThisMonthCents', 'updatedAt']))
+        );
+      allow delete: if isValidShortId(cardId) && (isOwner(existing().userId) || isAdmin());
+    }
+
+    // 7. Scheduled Payments
+    match /scheduledPayments/{scheduledId} {
+      allow get: if isValidShortId(scheduledId) && (isOwner(existing().userId) || isAdmin());
+      allow list: if isAdmin() || (isSignedInMember() && existing().userId == request.auth.uid);
+      allow create: if isValidShortId(scheduledId)
+        && isSignedInMember()
+        && isValidScheduledPayment(incoming(), scheduledId)
+        && ((incoming().userId == request.auth.uid && ownsAccount(incoming().accountId)) || (isAdmin() && accountExists(incoming().accountId)))
+        && incoming().status == 'scheduled'
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidShortId(scheduledId)
+        && (isOwner(existing().userId) || isAdmin())
+        && isValidScheduledPayment(incoming(), scheduledId)
+        && existing().status == 'scheduled'
+        && incoming().id == existing().id
+        && incoming().userId == existing().userId
+        && incoming().accountId == existing().accountId
+        && incoming().currency == existing().currency
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          // Action: Advance Next Due Date (Recurring Execution)
+          (incoming().status == 'scheduled' && incoming().diff(existing()).affectedKeys().hasOnly(['nextDueDate', 'updatedAt'])) ||
+          // Action: Complete or Cancel Scheduled Payment
+          (incoming().status in ['completed', 'cancelled'] && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt']))
+        );
+      allow delete: if isValidShortId(scheduledId) && (isOwner(existing().userId) || isAdmin());
+    }
+
+    // 8. PII-Safe Recipient Directory (Exact key lookup only for non-admins)
+    match /recipientDirectory/{lookupKey} {
+      allow get: if isValidLookupKey(lookupKey) && isSignedInMember();
+      allow list: if isAdmin();
+      allow create: if isValidLookupKey(lookupKey)
+        && isSignedInMember()
+        && isValidRecipientDirectoryEntry(incoming(), lookupKey)
+        && ((incoming().userId == request.auth.uid && ownsAccount(incoming().accountId)) || (isAdmin() && accountExists(incoming().accountId)))
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidLookupKey(lookupKey)
+        && (isOwner(existing().userId) || isAdmin() || isClaimedSeededOwner(existing().userId))
+        && isValidRecipientDirectoryEntry(incoming(), lookupKey)
+        && incoming().lookupKey == existing().lookupKey
+        && incoming().accountId == existing().accountId
+        && incoming().currency == existing().currency
+        && incoming().accountLast4 == existing().accountLast4
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          (
+            incoming().userId == existing().userId
+            && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'handle', 'accountName', 'status', 'updatedAt'])
+          ) ||
+          (
+            isClaimedSeededOwner(existing().userId)
+            && incoming().userId == request.auth.uid
+            && incoming().diff(existing()).affectedKeys().hasOnly(['userId', 'updatedAt'])
+          )
+        );
+      allow delete: if isValidLookupKey(lookupKey) && (isOwner(existing().userId) || isAdmin());
+    }
+
+    // 9. Atomic Peer Transfer Proof Records (Immutable)
+    match /peerTransfers/{transferId} {
+      allow get: if isValidShortId(transferId)
+        && (isOwner(existing().fromUserId) || isOwner(existing().toUserId) || isAdmin());
+      allow list: if isAdmin()
+        || (isSignedInMember() && (existing().fromUserId == request.auth.uid || existing().toUserId == request.auth.uid));
+      allow create: if isValidShortId(transferId)
+        && isSignedInMember()
+        && hasWithdrawalAccess(request.auth.uid)
+        && isValidPeerTransfer(incoming(), transferId)
+        && incoming().fromUserId == request.auth.uid
+        && ownsAccount(incoming().fromAccountId)
+        && incoming().createdAt == request.time
+        && existsAfter(/databases/$(database)/documents/accounts/$(incoming().fromAccountId))
+        && get(/databases/$(database)/documents/accounts/$(incoming().fromAccountId)).data.balanceCents
+           - getAfter(/databases/$(database)/documents/accounts/$(incoming().fromAccountId)).data.balanceCents
+           == incoming().amountCents
+        && existsAfter(/databases/$(database)/documents/accounts/$(incoming().toAccountId))
+        && getAfter(/databases/$(database)/documents/accounts/$(incoming().toAccountId)).data.lastTransferId == transferId;
+      allow update, delete: if false;
+    }
+
+    // 10. Delegated Admin Registry
+    match /admins/{adminUid} {
+      allow get: if isValidId(adminUid) && (isOwner(adminUid) || isAdmin());
+      allow list: if isAdmin();
+      allow create: if isValidId(adminUid)
+        && isAdmin()
+        && isValidAdminRecord(incoming(), adminUid)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if false;
+      allow delete: if isValidId(adminUid) && isAdmin() && adminUid != request.auth.uid;
+    }
+
+    // 11. Member Credential Bindings (Hash-protected account/routine bindings)
+    match /memberCredentials/{accountNumber} {
+      allow get: if isValidLookupKey(accountNumber)
+        && (
+          isAdmin()
+          || (isSignedInMember() && (existing().userId == request.auth.uid || existing().claimedUid == request.auth.uid))
+        );
+      allow list: if isAdmin();
+      allow create: if isValidLookupKey(accountNumber)
+        && isSignedInMember()
+        && isValidMemberCredential(incoming(), accountNumber)
+        && (
+          (incoming().userId == request.auth.uid && incoming().claimedUid == request.auth.uid && incoming().claimProof == '')
+          || (isAdmin() && incoming().claimedUid == '' && incoming().claimProof == '')
+        )
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidLookupKey(accountNumber)
+        && isSignedInMember()
+        && isValidMemberCredential(incoming(), accountNumber)
+        && existing().claimedUid == ''
+        && existing().claimProof == ''
+        && incoming().claimedUid == request.auth.uid
+        && incoming().userId == request.auth.uid
+        && incoming().claimProof == existing().routingHash
+        && incoming().accountNumber == existing().accountNumber
+        && incoming().routingHash == existing().routingHash
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['claimedUid', 'userId', 'claimProof', 'updatedAt']);
+      allow delete: if false;
+    }
+  }
+}
